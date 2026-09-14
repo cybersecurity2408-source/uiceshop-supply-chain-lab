@@ -25,131 +25,129 @@ jobs:
       - name: Install Dependencies
         run: npm install --legacy-peer-deps --ignore-scripts
 
-      # 2. Install Syft and Grype CLIs directly
-      - name: Install Syft and Grype CLIs
+      # 2. Install Syft, Grype, and PDF conversion tools
+      - name: Install Syft, Grype, and wkhtmltopdf
         run: |
           curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
           curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
+          sudo apt-get update && sudo apt-get install -y wkhtmltopdf jq
 
-      # 3. Generate SBOM from node_modules
+      # 3. Force Syft to scan node_modules directly without ignoring gitignored folders
       - name: Generate Full SBOM
         run: syft dir:./node_modules --exclude "" -o spdx-json=juiceshop.sbom.json
 
-      # 4. Upload raw SBOM artifact
+      # 4. Upload raw SBOM artifact for download/verification
       - name: Upload SBOM Artifact
         uses: actions/upload-artifact@v4
         with:
           name: juiceshop-sbom
           path: juiceshop.sbom.json
 
-      # 5. Scan SBOM with Grype → CSV (contains all columns needed for PDF)
-      - name: Scan SBOM with Grype (CSV)
+      # 5. Scan SBOM with Grype and generate JSON & SARIF reports
+      - name: Scan SBOM with Grype
         run: |
-          grype sbom:juiceshop.sbom.json -o csv > grype-results.csv
-        continue-on-error: true
-
-      # 6. Scan SBOM with Grype → SARIF (for GitHub Security tab)
-      - name: Scan SBOM with Grype (SARIF)
-        run: |
+          grype sbom:juiceshop.sbom.json -o json > grype-results.json
           grype sbom:juiceshop.sbom.json -o sarif > results.sarif
         continue-on-error: true
 
-      # 7. Upload SARIF to GitHub Security
+      # 6. Convert Grype JSON output to HTML and generate PDF matching target layout
+      - name: Generate Grype PDF Report
+        run: |
+          cat << 'EOF' > generate_pdf.py
+          import json
+          import subprocess
+
+          with open('grype-results.json') as f:
+              data = json.load(f)
+
+          matches = data.get('matches', [])
+
+          rows = ""
+          for match in matches:
+              vuln = match.get('vulnerability', {})
+              pkg = match.get('artifact', {})
+
+              cve_id = vuln.get('id', 'N/A')
+
+              # Get GHSA / Original ID if available in related vulnerabilities
+              related = vuln.get('relatedVulnerabilities', [])
+              ghsa_id = related[0].get('id', 'N/A') if related else 'N/A'
+
+              severity = vuln.get('severity', 'Unknown').capitalize()
+              package_name = pkg.get('name', 'N/A')
+              installed_version = pkg.get('version', 'N/A')
+
+              # Extract fixed versions
+              fix_versions = vuln.get('fix', {}).get('versions', [])
+              fix_version = ", ".join(fix_versions) if fix_versions else "N/A"
+
+              # Format severity color (High -> orange/yellow)
+              sev_color = "#d97706" if severity == "High" else "#dc2626" if severity == "Critical" else "#2563eb"
+
+              rows += f"""
+              <tr>
+                  <td><strong>{cve_id}</strong></td>
+                  <td>{ghsa_id}</td>
+                  <td style="color: {sev_color}; font-weight: bold;">{severity}</td>
+                  <td>{package_name}</td>
+                  <td>{installed_version}</td>
+                  <td>{fix_version}</td>
+              </tr>
+              """
+
+          html_content = f"""
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <style>
+                  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; }}
+                  h1 {{ font-size: 32px; color: #2d3748; margin-bottom: 24px; }}
+                  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
+                  th {{ background-color: #f8fafc; text-align: left; padding: 12px 16px; border-bottom: 2px solid #e2e8f0; border-right: 1px solid #e2e8f0; font-weight: 600; color: #0f172a; }}
+                  td {{ padding: 12px 16px; border-bottom: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; color: #334155; }}
+                  th:last-child, td:last-child {{ border-right: none; }}
+                  tr:nth-child(even) {{ background-color: #fafafa; }}
+              </style>
+          </head>
+          <body>
+              <h1>Grype Vulnerability Report</h1>
+              <table>
+                  <thead>
+                      <tr>
+                          <th>CVE ID</th>
+                          <th>GHSA / Original ID</th>
+                          <th>Severity</th>
+                          <th>Package</th>
+                          <th>Installed Version</th>
+                          <th>Fix Version</th>
+                      </tr>
+                  </thead>
+                  <tbody>
+                      {rows}
+                  </tbody>
+              </table>
+          </body>
+          </html>
+          """
+
+          with open('grype-report.html', 'w') as f:
+              f.write(html_content)
+
+          EOF
+          python3 generate_pdf.py
+          wkhtmltopdf --enable-local-file-access grype-report.html grype-vulnerability-report.pdf
+
+      # 7. Upload generated PDF report as build artifact
+      - name: Upload PDF Report Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: grype-vulnerability-report
+          path: grype-vulnerability-report.pdf
+
+      # 8. Upload SARIF results to GitHub Security tab
       - name: Upload SARIF to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: results.sarif
           category: "grype-sbom"
-
-      # 8. Install PDF rendering dependencies
-      - name: Install PDF Dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wkhtmltopdf
-          pip install pandas
-
-      # 9. Build the PDF report
-      - name: Generate Grype PDF Report
-        run: |
-          python3 << 'EOF'
-          import pandas as pd
-          import subprocess
-          import html
-          import os
-
-          # Load Grype CSV output
-          df = pd.read_csv("grype-results.csv")
-
-          # Map Grype CSV columns → report columns
-          # Grype CSV columns typically include: vulnerability, severity, package, version, fix, ...
-          # We'll rename/select to match the report layout.
-          report = pd.DataFrame({
-              "CVE ID":            df.get("vulnerability", ""),
-              "GHSA / Original ID": df.get("vulnerability", ""),  # Grype uses same field; GHSA often in 'vulnerability' for GHSA IDs
-              "Severity":          df.get("severity", ""),
-              "Package":           df.get("package", ""),
-              "Installed Version": df.get("version", ""),
-              "Fix Version":       df.get("fix", ""),
-          })
-
-          # Optional: filter to High and Critical only (remove this line to show all)
-          # report = report[report["Severity"].str.lower().isin(["high", "critical"])]
-
-          # Build styled HTML table
-          rows_html = ""
-          for _, row in report.iterrows():
-              sev = str(row["Severity"]).lower()
-              color = {"critical": "#d32f2f", "high": "#f57c00", "medium": "#fbc02d", "low": "#388e3c"}.get(sev, "#555")
-              rows_html += "<tr>" + "".join(
-                  f"<td>{html.escape(str(v))}</td>" for v in row.values
-              ) + "</tr>"
-
-          html_doc = f"""
-          <html>
-          <head>
-          <meta charset="utf-8">
-          <style>
-            body {{ font-family: Arial, Helvetica, sans-serif; margin: 20px; }}
-            h1 {{ font-size: 22px; margin-bottom: 12px; }}
-            table {{ border-collapse: collapse; width: 100%; font-size: 12px; }}
-            th {{ background: #f2f2f2; text-align: left; padding: 8px; border: 1px solid #ccc; }}
-            td {{ padding: 8px; border: 1px solid #ccc; vertical-align: top; }}
-            tr:nth-child(even) {{ background: #fafafa; }}
-          </style>
-          </head>
-          <body>
-            <h1>Grype Vulnerability Report</h1>
-            <table>
-              <thead>
-                <tr>
-                  <th>CVE ID</th>
-                  <th>GHSA / Original ID</th>
-                  <th>Severity</th>
-                  <th>Package</th>
-                  <th>Installed Version</th>
-                  <th>Fix Version</th>
-                </tr>
-              </thead>
-              <tbody>
-                {rows_html}
-              </tbody>
-            </table>
-          </body>
-          </html>
-          """
-
-          with open("grype-report.html", "w") as f:
-              f.write(html_doc)
-
-          # Convert HTML → PDF
-          subprocess.run(["wkhtmltopdf", "--enable-local-file-access", "grype-report.html", "grype-report.pdf"], check=True)
-          print("PDF generated: grype-report.pdf")
-          EOF
-
-      # 10. Upload the PDF report
-      - name: Upload Grype PDF Report
-        uses: actions/upload-artifact@v4
-        with:
-          name: grype-vulnerability-report
-          path: grype-report.pdf
