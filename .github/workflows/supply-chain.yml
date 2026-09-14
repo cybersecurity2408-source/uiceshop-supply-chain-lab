@@ -1,345 +1,4 @@
-name: Supply Chain Security
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  security-events: write
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # 1. Install dependencies so node_modules exists
-      - name: Install Dependencies
-        run: npm install --legacy-peer-deps --ignore-scripts
-
-      # 2. Install Syft, Grype, and PDF conversion tools
-      - name: Install Syft, Grype, and wkhtmltopdf
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-          sudo apt-get update && sudo apt-get install -y wkhtmltopdf jq
-
-      # 3. Force Syft to scan node_modules directly without ignoring gitignored folders
-      - name: Generate Full SBOM
-        run: syft dir:./node_modules --exclude "" -o spdx-json=juiceshop.sbom.json
-
-      # 4. Upload raw SBOM artifact for download/verification
-      - name: Upload SBOM Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: juiceshop-sbom
-          path: juiceshop.sbom.json
-
-      # 5. Scan SBOM with Grype and generate JSON & SARIF reports
-      - name: Scan SBOM with Grype
-        run: |
-          grype sbom:juiceshop.sbom.json -o json > grype-results.json
-          grype sbom:juiceshop.sbom.json -o sarif > results.sarif
-        continue-on-error: true
-
-      # 6. Convert Grype JSON output to HTML and generate PDF matching target layout
-      - name: Generate Grype PDF Report
-        run: |
-          cat << 'EOF' > generate_pdf.py
-          import json
-          import subprocess
-
-          with open('grype-results.json') as f:
-              data = json.load(f)
-
-          matches = data.get('matches', [])
-
-          rows = ""
-          for match in matches:
-              vuln = match.get('vulnerability', {})
-              pkg = match.get('artifact', {})
-
-              cve_id = vuln.get('id', 'N/A')
-
-              # Get GHSA / Original ID if available in related vulnerabilities
-              related = vuln.get('relatedVulnerabilities', [])
-              ghsa_id = related[0].get('id', 'N/A') if related else 'N/A'
-
-              severity = vuln.get('severity', 'Unknown').capitalize()
-              package_name = pkg.get('name', 'N/A')
-              installed_version = pkg.get('version', 'N/A')
-
-              # Extract fixed versions
-              fix_versions = vuln.get('fix', {}).get('versions', [])
-              fix_version = ", ".join(fix_versions) if fix_versions else "N/A"
-
-              # Format severity color (High -> orange/yellow)
-              sev_color = "#d97706" if severity == "High" else "#dc2626" if severity == "Critical" else "#2563eb"
-
-              rows += f"""
-              <tr>
-                  <td><strong>{cve_id}</strong></td>
-                  <td>{ghsa_id}</td>
-                  <td style="color: {sev_color}; font-weight: bold;">{severity}</td>
-                  <td>{package_name}</td>
-                  <td>{installed_version}</td>
-                  <td>{fix_version}</td>
-              </tr>
-              """
-
-          html_content = f"""
-          <!DOCTYPE html>
-          <html>
-          <head>
-              <style>
-                  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; }}
-                  h1 {{ font-size: 32px; color: #2d3748; margin-bottom: 24px; }}
-                  table {{ width: 100%; border-collapse: collapse; font-size: 14px; }}
-                  th {{ background-color: #f8fafc; text-align: left; padding: 12px 16px; border-bottom: 2px solid #e2e8f0; border-right: 1px solid #e2e8f0; font-weight: 600; color: #0f172a; }}
-                  td {{ padding: 12px 16px; border-bottom: 1px solid #e2e8f0; border-right: 1px solid #e2e8f0; color: #334155; }}
-                  th:last-child, td:last-child {{ border-right: none; }}
-                  tr:nth-child(even) {{ background-color: #fafafa; }}
-              </style>
-          </head>
-          <body>
-              <h1>Grype Vulnerability Report</h1>
-              <table>
-                  <thead>
-                      <tr>
-                          <th>CVE ID</th>
-                          <th>GHSA / Original ID</th>
-                          <th>Severity</th>
-                          <th>Package</th>
-                          <th>Installed Version</th>
-                          <th>Fix Version</th>
-                      </tr>
-                  </thead>
-                  <tbody>
-                      {rows}
-                  </tbody>
-              </table>
-          </body>
-          </html>
-          """
-
-          with open('grype-report.html', 'w') as f:
-              f.write(html_content)
-
-          EOF
-          python3 generate_pdf.py
-          wkhtmltopdf --enable-local-file-access grype-report.html grype-vulnerability-report.pdf
-
-      # 7. Upload generated PDF report as build artifact
-      - name: Upload PDF Report Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: grype-vulnerability-report
-          path: grype-vulnerability-report.pdf
-
-      # 8. Upload SARIF results to GitHub Security tab
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: "grype-sbom"
-name: Supply Chain Security
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  security-events: write
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # Setup Python environment cleanly for GuardDog
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # 1. Install dependencies so node_modules exists
-      - name: Install Dependencies
-        run: npm install --legacy-peer-deps --ignore-scripts
-
-      # 2. Install Syft and Grype CLIs directly
-      - name: Install Syft and Grype CLIs
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-
-      # 3. Force Syft to scan node_modules directly without ignoring gitignored folders
-      - name: Generate Full SBOM
-        run: syft dir:./node_modules --exclude "" -o spdx-json=juiceshop.sbom.json
-
-      # 4. Upload raw SBOM artifact for download/verification
-      - name: Upload SBOM Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: juiceshop-sbom
-          path: juiceshop.sbom.json
-
-      # 5. Scan the complete SBOM with Grype and output a valid SARIF file
-      - name: Scan SBOM with Grype
-        run: grype sbom:juiceshop.sbom.json -o sarif > results.sarif
-        continue-on-error: true
-
-      # 6. Upload SARIF results to GitHub Security tab
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: "grype-sbom"
-
-name: Supply Chain Security
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  security-events: write
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # Setup Python environment cleanly for GuardDog
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # 1. Install dependencies so node_modules exists
-      - name: Install Dependencies
-        run: npm install --legacy-peer-deps --ignore-scripts
-
-      # 2. Install Syft and Grype CLIs directly
-      - name: Install Syft and Grype CLIs
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-
-      # 3. Force Syft to scan node_modules directly without ignoring gitignored folders
-      - name: Generate Full SBOM
-        run: syft dir:./node_modules --exclude "" -o spdx-json=juiceshop.sbom.json
-
-      # 4. Upload raw SBOM artifact for download/verification
-      - name: Upload SBOM Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: juiceshop-sbom
-          path: juiceshop.sbom.json
-
-      # 5. Scan the complete SBOM with Grype and output a valid SARIF file
-      - name: Scan SBOM with Grype
-        run: grype sbom:juiceshop.sbom.json -o sarif > results.sarif
-        continue-on-error: true
-
-      # 6. Upload SARIF results to GitHub Security tab
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: "grype-sbom"
-
-name: Supply Chain Security
-
-on:
-  push:
-    branches: [ "main", "master" ]
-  workflow_dispatch:
-
-permissions:
-  contents: read
-  security-events: write
-
-jobs:
-  scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      # Setup Python environment cleanly for GuardDog
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      # 1. Install dependencies so node_modules exists
-      - name: Install Dependencies
-        run: npm install --legacy-peer-deps --ignore-scripts
-
-      # 2. Install Syft and Grype CLIs directly
-      - name: Install Syft and Grype CLIs
-        run: |
-          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
-          curl -sSfL https://raw.githubusercontent.com/anchore/grype/main/install.sh | sh -s -- -b /usr/local/bin
-
-      # 3. Force Syft to scan node_modules directly without ignoring gitignored folders
-      - name: Generate Full SBOM
-        run: syft dir:./node_modules --exclude "" -o spdx-json=juiceshop.sbom.json
-
-      # 4. Upload raw SBOM artifact for download/verification
-      - name: Upload SBOM Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: juiceshop-sbom
-          path: juiceshop.sbom.json
-
-      # 5. Scan the complete SBOM with Grype and output a valid SARIF file
-      - name: Scan SBOM with Grype
-        run: grype sbom:juiceshop.sbom.json -o sarif > results.sarif
-        continue-on-error: true
-
-      # 6. Upload SARIF results to GitHub Security tab
-      - name: Upload SARIF to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: results.sarif
-          category: "grype-sbom"
-
+cat > .github/workflows/supply-chain.yml << 'EOF'
 name: Supply Chain Security
 
 on:
@@ -370,15 +29,9 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 1. Install dependencies so node_modules exists.
-      #    --ignore-scripts blocks install-time postinstall hooks from running
-      #    arbitrary code on the runner before it's even been scanned.
       - name: Install Dependencies
         run: npm install --legacy-peer-deps --ignore-scripts
 
-      # 2. Generate SBOM using Anchore's maintained sbom-action instead of
-      #    piping a raw install.sh from `main` into `sh`. This is a versioned,
-      #    marketplace-published action rather than an unverified script.
       - name: Generate Full SBOM
         uses: anchore/sbom-action@v0
         with:
@@ -387,16 +40,12 @@ jobs:
           output-file: juiceshop.sbom.json
           upload-artifact: false
 
-      # 3. Upload raw SBOM artifact for download/verification
       - name: Upload SBOM Artifact
         uses: actions/upload-artifact@v4
         with:
           name: juiceshop-sbom
           path: juiceshop.sbom.json
 
-      # 4. Scan the SBOM with Grype via anchore/scan-action. fail-build:true
-      #    means the job actually fails on high+ severity findings instead of
-      #    silently continuing. Adjust severity-cutoff to your risk tolerance.
       - name: Scan SBOM with Grype
         id: grype-scan
         uses: anchore/scan-action@v3
@@ -406,9 +55,6 @@ jobs:
           severity-cutoff: high
           output-format: sarif
 
-      # 5. Always upload whatever SARIF was produced, even if the scan step
-      #    above failed the build — we still want results visible in the
-      #    Security tab.
       - name: Upload SARIF to GitHub Security
         if: always()
         uses: github/codeql-action/upload-sarif@v3
@@ -422,10 +68,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
-      # 6. Scan the ACTUAL resolved versions from package-lock.json, not
-      #    whatever happens to be latest on the npm registry right now.
-      #    This job now fails (exit 1) if GuardDog reports any issue that
-      #    isn't in the excluded rule set, instead of swallowing every error.
       - name: Run GuardDog Dependency Scan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -438,7 +80,6 @@ jobs:
           fi
 
           echo "Extracting resolved name@version pairs from package-lock.json..."
-          # Handles lockfileVersion 2/3 (.packages) format.
           jq -r '
             .packages
             | to_entries[]
@@ -498,3 +139,4 @@ jobs:
           name: guarddog-results
           path: guarddog-results/
           if-no-files-found: ignore
+EOF
